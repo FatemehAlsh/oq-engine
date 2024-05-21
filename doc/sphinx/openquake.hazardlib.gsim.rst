@@ -124,6 +124,14 @@ allen_2022
     :undoc-members:
     :show-inheritance:
 
+ambraseys_2005
+------------------------------------------
+
+.. automodule:: openquake.hazardlib.gsim.ambraseys_2005
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 ameri_2017
 ---------------------------------------------------
 
