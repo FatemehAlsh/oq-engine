@@ -201,16 +201,14 @@ def export_aelo_csv(key, dstore):
 
     elif key == 'uhs':
         arr = dstore['hmaps-stats'][0, 0]  # shape (M, P)
-        M, P = arr.shape
         periods = [imt.period for imt in oq.imt_periods()]
-        array = numpy.zeros(M*P, [('poe', float), ('period', float),
-                                  ('iml', float)])
+        poes = [('poe-%s' % poe, float) for poe in oq.poes]
+        array = numpy.zeros(len(periods), [('period', float)] + poes)
         for m, period in enumerate(periods):
+            row = array[m]
+            row['period'] = period
             for p, poe in enumerate(oq.poes):
-                row = array[p*M + m]
-                row['poe'] = poe
-                row['period'] = period
-                row['iml'] = arr[m, p]
+                row['poe-%s' % poe] = arr[m, p]
         writers.write_csv(fname, array, comment=comment)
 
     return [fname]
@@ -569,8 +567,7 @@ def export_disagg_csv(ekey, dstore):
                   tectonic_region_types=decode(bins['TRT'].tolist()),
                   lon=lon, lat=lat)
         if spec.startswith('rlzs') or oq.iml_disagg:
-            weights = numpy.array([rlzs[r].weight['weight']
-                                   for r in best_rlzs[s]])
+            weights = numpy.array([rlzs[r].weight[-1] for r in best_rlzs[s]])
             weights /= weights.sum()  # normalize to 1
             md['weights'] = weights.tolist()
             md['rlz_ids'] = best_rlzs[s].tolist()

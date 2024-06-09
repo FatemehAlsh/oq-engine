@@ -488,10 +488,12 @@ class EventBasedTestCase(CalculatorTestCase):
         mean, *others = export(('hcurves', 'csv'), self.calc.datastore)
         self.assertEqualFiles('expected/hazard_curve-PGA.csv', mean)
 
+    def test_case_25_bis(self):
         self.run_calc(case_25.__file__, 'job2.ini')
         mean, *others = export(('hcurves', 'csv'), self.calc.datastore)
         self.assertEqualFiles('expected/hazard_curve-PGA.csv', mean)
 
+    def test_case_25_tris(self):
         # test with common1.xml present into branchs and sampling
         self.run_calc(case_25.__file__, 'job_common.ini')
         mean, *others = export(('ruptures', 'csv'), self.calc.datastore)
@@ -506,10 +508,10 @@ class EventBasedTestCase(CalculatorTestCase):
         self.assertGreater(pd_mean, 0)
         self.assertGreater(nd_mean, 0)
         [fname, _, _] = export(('gmf_data', 'csv'), self.calc.datastore)
-        arr = read_csv(fname)[:2]
+        arr = read_csv(fname, {'custom_site_id': str, None: float})[:2]
         self.assertEqual(arr.dtype.names,
-                         ('site_id', 'event_id', 'gmv_PGA',
-                          'sep_Disp', 'sep_DispProb'))
+                         ('event_id', 'gmv_PGA',
+                          'sep_Disp', 'sep_DispProb', 'custom_site_id'))
 
     def test_case_26_liq(self):
         # cali liquefaction simplified

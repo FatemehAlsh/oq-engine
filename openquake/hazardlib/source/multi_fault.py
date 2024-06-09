@@ -36,10 +36,12 @@ from openquake.hazardlib.geo.utils import (
 from openquake.hazardlib.source.base import BaseSeismicSource
 
 U16 = np.uint16
+U32 = np.uint32
 F32 = np.float32
 F64 = np.float64
 BLOCKSIZE = 5_000
 TWO16 = 2 ** 16
+TWO32 = 2 ** 32
 # NB: if too large, very few sources will be generated and a lot of
 # memory will be used
 
@@ -113,6 +115,14 @@ class MultiFaultSource(BaseSeismicSource):
                 return h5[key][:]
             except KeyError:
                 raise KeyError(f'{key} not found in {self.hdf5path}')
+
+    def set_sections(self, sections):
+        """
+        Used in the UCERF converter, not in the engine
+        """
+        self.sections = sections
+        dic = {i: sec for i, sec in enumerate(sections)}
+        save([self], dic, f'{self.source_id}.hdf5', del_rupture_idxs=False)
 
     def set_msparams(self, secparams, close_sec=None, ry0=False,
                      mon1=performance.Monitor(),
@@ -249,22 +259,23 @@ class MultiFaultSource(BaseSeismicSource):
 
 
 # NB: as side effect delete _rupture_idxs and add .hdf5path
-def save(mfsources, sectiondict, hdf5path):
+def save(mfsources, sectiondict, hdf5path, del_rupture_idxs=True):
     """
     Utility to serialize MultiFaultSources and optionally computing msparams
     """
-    assert len(sectiondict) < TWO16, len(sectiondict)
+    assert len(sectiondict) < TWO32, len(sectiondict)
     s2i = {idx: i for i, idx in enumerate(sectiondict)}
     all_rids = []
     for src in mfsources:
         try:
-            rids = [U16([s2i[idx] for idx in idxs])
+            rids = [U32([s2i[idx] for idx in idxs])
                     for idxs in src._rupture_idxs]
         except KeyError as exc:
             raise IndexError('The section index %s in source %r is invalid'
                              % (exc.args[0], src.source_id))
         all_rids.append(rids)
-        delattr(src, '_rupture_idxs')  # save memory
+        if del_rupture_idxs:
+            delattr(src, '_rupture_idxs')  # save memory
         src.hdf5path = hdf5path
 
     # store data

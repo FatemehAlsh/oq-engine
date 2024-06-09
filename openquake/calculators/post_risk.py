@@ -24,7 +24,7 @@ import numpy
 import pandas
 
 from openquake.baselib import general, parallel, python3compat
-from openquake.commonlib import readinput, datastore, logs
+from openquake.commonlib import datastore, logs
 from openquake.risklib import asset, scientific, reinsurance
 from openquake.engine import engine
 from openquake.calculators import base, views
@@ -179,8 +179,11 @@ def get_loss_builder(dstore, oq, return_periods=None, loss_dt=None,
     max_events = num_events.max()
     periods = return_periods or oq.return_periods or scientific.return_periods(
         haz_time, max_events)  # in case_master [1, 2, 5, 10]
-    max_period = periods[-1]
-    pla_factor = readinput.get_pla_factor(oq, max_period / max_events)
+    if 'post_loss_amplification' in oq.inputs:
+        pla_factor = scientific.pla_factor(
+            dstore.read_df('post_loss_amplification'))
+    else:
+        pla_factor = None
     return scientific.LossCurvesMapsBuilder(
         oq.conditional_loss_poes, numpy.array(periods),
         loss_dt or oq.loss_dt(), weights,
@@ -370,12 +373,16 @@ def build_store_agg(dstore, oq, rbe_df, num_events):
                 ndamaged = sum(df[col].sum() for col in dmgs)
                 acc['dmg_0'].append(aggnumber[agg_id] - ndamaged / ne)
             for col in columns:
-                sorted_losses = df[col].sort_values().to_numpy()
-                fixed_losses, _ = scientific.fix_losses(
-                    sorted_losses, ne, builder.eff_time, builder.pla_factor)
-                agg = fixed_losses.sum()
+                losses = df[col].sort_values().to_numpy()
+                sorted_losses, _, eperiods = scientific.fix_losses(
+                    losses, ne, builder.eff_time)
+                agg = sorted_losses.sum()
                 acc[col].append(
                     agg * tr if oq.investigation_time else agg/ne)
+                if builder.pla_factor:
+                    agg = sorted_losses @ builder.pla_factor(eperiods)
+                    acc['pla_' + col].append(
+                        agg * tr if oq.investigation_time else agg/ne)
     fix_dtypes(acc)
     aggrisk = pandas.DataFrame(acc)
     dstore.create_df('aggrisk', aggrisk, limit_states=' '.join(oq.limit_states))
@@ -579,14 +586,14 @@ class PostRiskCalculator(base.RiskCalculator):
         if not ok:  # the hazard is to small
             return
         oq = self.oqparam
-        if oq.investigation_time and 'risk' in oq.calculation_mode:
+        if 'risk' in oq.calculation_mode:
             self.datastore['oqparam'] = oq
             for ln in self.oqparam.loss_types:
                 li = scientific.LOSSID[ln]
                 dloss = views.view('delta_loss:%d' % li, self.datastore)
                 if dloss['delta'].mean() > .1:  # more than 10% variation
                     logging.warning(
-                        'A big variation in the %s loss curve is expected: try'
+                        'A big variation in the %s losses is expected: try'
                         '\n$ oq show delta_loss:%d %d', ln, li,
                         self.datastore.calc_id)
         logging.info('Sanity check on avg_losses and aggrisk')

@@ -27,7 +27,7 @@ import pandas
 import collections
 from openquake.baselib import config, performance
 from openquake.qa_tests_data import mosaic
-from openquake.commonlib import readinput, logs, datastore
+from openquake.commonlib import readinput, logs, datastore, oqvalidation
 from openquake.calculators import views
 from openquake.engine import engine
 from openquake.engine.aristotle import main_cmd
@@ -168,7 +168,8 @@ def from_file(fname, mosaic_dir, concurrent_jobs):
 
 def run_site(lonlat_or_fname, mosaic_dir=None,
              *, hc: int = None, slowest: int = None,
-             concurrent_jobs: int = None, vs30: float = 760):
+             concurrent_jobs: int = None, vs30: float = 760,
+             asce_version: str = oqvalidation.OqParam.asce_version.default):
     """
     Run a PSHA analysis on the given sites or given a CSV file
     formatted as described in the 'from_file' function. For instance
@@ -182,7 +183,8 @@ def run_site(lonlat_or_fname, mosaic_dir=None,
         from_file(lonlat_or_fname, mosaic_dir, concurrent_jobs)
         return
     sites = lonlat_or_fname.replace(',', ' ').replace(':', ',')
-    params = get_params_from(dict(sites=sites, vs30=vs30), mosaic_dir)
+    params = get_params_from(
+        dict(sites=sites, vs30=vs30, asce_version=asce_version), mosaic_dir)
     logging.root.handlers = []  # avoid breaking the logs
     [jobctx] = engine.create_jobs([params], config.distribution.log_level,
                                   None, getpass.getuser(), hc)
@@ -198,7 +200,9 @@ run_site.hc = 'previous calculation ID'
 run_site.slowest = 'profile and show the slowest operations'
 run_site.concurrent_jobs = 'maximum number of concurrent jobs'
 run_site.vs30 = 'vs30 value for the calculation'
-
+run_site.asce_version = dict(
+    help='ASCE version',
+    choices=oqvalidation.OqParam.asce_version.validator.choices)
 
 # ######################### sample rups and gmfs ######################### #
 
@@ -296,31 +300,40 @@ def callback(job_id, params, exc=None):
     aristotle_res['res_list'].append((job_id, description, error))
 
 
-def aristotle(mosaic_dir='', rupfname=FAMOUS):
+def aristotle(mosaic_dir='', *,
+              rupfname: str = FAMOUS,
+              maximum_distance: int = 300,
+              number_of_ground_motion_fields: int = 10):
     """
-    Run Aristotle calculations starting from a file with planar
-    ruptures (by default "famous_ruptures.csv"). You must pass
+    Run Aristotle calculations starting from a rupture file that can be
+    an XML or a CSV (by default "famous_ruptures.csv"). You must pass
     a directory containing two files site_model.hdf5 and exposure.hdf5
     with a well defined structure.
     """
     if not mosaic_dir and not config.directory.mosaic_dir:
         sys.exit('mosaic_dir is not specified in openquake.cfg')
     trt = None
-    maximum_distance = 300
     truncation_level = 3
-    number_of_ground_motion_fields = 10
     asset_hazard_distance = 15
     ses_seed = 42
     t0 = time.time()
-    rupture_file = None
-    for i, row in pandas.read_csv(rupfname).iterrows():
-        rupdic = row.to_dict()
-        rupdic['rake'] = 0.
-        rupdic['dip'] = 90.
-        rupdic['strike'] = 0.
-        rupdic['rupture_file'] = None
-        usgs_id = rupdic['usgs_id']
-        main_cmd(usgs_id, rupture_file, rupdic, callback,
+    if rupfname.endswith('.csv'):
+        rupture_file = None
+        for i, row in pandas.read_csv(rupfname).iterrows():
+            rupdic = row.to_dict()
+            rupdic['rake'] = 0.
+            rupdic['dip'] = 90.
+            rupdic['strike'] = 0.
+            rupdic['rupture_file'] = None
+            usgs_id = rupdic['usgs_id']
+            main_cmd(usgs_id, rupture_file, rupdic, callback,
+                     maximum_distance=maximum_distance,
+                     trt=trt, truncation_level=truncation_level,
+                     number_of_ground_motion_fields=number_of_ground_motion_fields,
+                     asset_hazard_distance=asset_hazard_distance,
+                     ses_seed=ses_seed, mosaic_dir=mosaic_dir)
+    else: # assume .xml
+        main_cmd('FromFile', rupfname, None, callback,
                  maximum_distance=maximum_distance,
                  trt=trt, truncation_level=truncation_level,
                  number_of_ground_motion_fields=number_of_ground_motion_fields,
@@ -335,7 +348,10 @@ def aristotle(mosaic_dir='', rupfname=FAMOUS):
 
 
 aristotle.mosaic_dir = 'Directory containing site_model.hdf5 and exposure.hdf5'
-aristotle.rupfname = 'Filename with planar ruptures'
+aristotle.rupfname = ('Filename with the same format as famous_ruptures.csv '
+                      'or file rupture_model.xml')
+aristotle.maximum_distance = 'Maximum distance in km'
+aristotle.number_of_ground_motion_fields = 'Number of ground motion fields'
 
 # ################################## main ################################## #
 

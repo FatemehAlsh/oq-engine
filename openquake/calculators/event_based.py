@@ -29,7 +29,7 @@ from shapely import geometry
 from openquake.baselib import config, hdf5, parallel, python3compat
 from openquake.baselib.general import (
     AccumDict, humansize, groupby, block_splitter)
-from openquake.hazardlib.probability_map import ProbabilityMap, get_mean_curve
+from openquake.hazardlib.map_array import MapArray, get_mean_curve
 from openquake.hazardlib.stats import geom_avg_std, compute_stats
 from openquake.hazardlib.calc.stochastic import sample_ruptures
 from openquake.hazardlib.contexts import ContextMaker, FarAwayRupture
@@ -79,10 +79,9 @@ def build_hcurves(calc):
     the stored GMFs. Works only for few sites.
     """
     oq = calc.oqparam
-    rlzs = calc.full_lt.get_realizations()
     # compute and save statistics; this is done in process and can
     # be very slow if there are thousands of realizations
-    weights = [rlz.weight['weight'] for rlz in rlzs]
+    weights = calc.full_lt.weights[:, -1]
     # NB: in the future we may want to save to individual hazard
     # curves if oq.individual_rlzs is set; for the moment we
     # save the statistical curves only
@@ -102,7 +101,7 @@ def build_hcurves(calc):
             poes = gmvs_to_poes(df, oq.imtls, oq.ses_per_logic_tree_path)
             for m, imt in enumerate(oq.imtls):
                 hcurves[rsi2str(rlz, sid, imt)] = poes[m]
-    pmaps = {r: ProbabilityMap(calc.sitecol.sids, L1*M, 1).fill(0)
+    pmaps = {r: MapArray(calc.sitecol.sids, L1*M, 1).fill(0)
              for r in range(R)}
     for key, poes in hcurves.items():
         r, sid, imt = str2rsi(key)
@@ -144,7 +143,7 @@ def build_hcurves(calc):
                 'hmaps-stats', site_id=N, stat=list(hstats),
                 imt=list(oq.imtls), poes=oq.poes)
         for s, stat in enumerate(hstats):
-            smap = ProbabilityMap(calc.sitecol.sids, L1, M)
+            smap = MapArray(calc.sitecol.sids, L1, M)
             [smap.array] = compute_stats(
                 numpy.array([p.array for p in pmaps]),
                 [hstats[stat]], weights)
@@ -221,6 +220,7 @@ def event_based(proxies, cmaker, stations, dstore, monitor):
     """
     Compute GMFs and optionally hazard curves
     """
+    shr = monitor.shared
     oq = cmaker.oq
     alldata = []
     se_dt = sig_eps_dt(oq.imtls)
@@ -230,7 +230,6 @@ def event_based(proxies, cmaker, stations, dstore, monitor):
     mmon = monitor('computing mean_stds', measuremem=False)
     cmon = monitor('computing gmfs', measuremem=False)
     umon = monitor('updating gmfs', measuremem=False)
-    rmon = monitor('reading mea,tau,phi', measuremem=False)
     max_iml = oq.get_max_iml()
     cmaker.scenario = 'scenario' in oq.calculation_mode
     with dstore:
@@ -258,7 +257,8 @@ def event_based(proxies, cmaker, stations, dstore, monitor):
                     continue
             if hasattr(computer, 'station_data'):  # conditioned GMFs
                 assert cmaker.scenario
-                df = computer.compute_all(dstore, rmon, cmon, umon)
+                with shr['mea'] as mea, shr['tau'] as tau, shr['phi'] as phi:
+                    df = computer.compute_all([mea, tau, phi], cmon, umon)
             else:  # regular GMFs
                 with mmon:
                     mean_stds = cmaker.get_mean_stds(
@@ -348,6 +348,7 @@ def starmap_from_rups(func, oq, full_lt, sitecol, dstore, save_tmp=None):
         oq.concurrent_tasks or 1)
     logging.info('totw = {:_d}'.format(round(totw)))
     if station_data is not None:
+        # assume scenario with a single true rupture
         rlzs_by_gsim = full_lt.get_rlzs_by_gsim(0)
         cmaker = ContextMaker(trt, rlzs_by_gsim, oq)
         cmaker.scenario = True
@@ -359,29 +360,34 @@ def starmap_from_rups(func, oq, full_lt, sitecol, dstore, save_tmp=None):
         G = len(cmaker.gsims)
         M = len(cmaker.imts)
         N = len(computer.sitecol)
-        size = 3 * G * M * N * N * 8  # sig, tau, phi
-        logging.info('Storing %s in conditioned/gsim', humansize(size))
+        size = 2 * G * M * N * N * 8  # tau, phi
+        msg = f'{G=} * {M=} * {humansize(N*N*8)} * 2'
+        logging.info('Requiring %s for tau, phi [%s]', humansize(size), msg)
         if size > float(config.memory.conditioned_gmf_gb) * 1024**3:
             raise ValueError(
                 f'The calculation is too large: {G=}, {M=}, {N=}. '
                 'You must reduce the number of sites i.e. enlarge '
                 'region_grid_spacing)')
-        mean_covs = computer.get_mean_covs()
-        for key, val in zip(['mea', 'sig', 'tau', 'phi'], mean_covs):
-            for g in range(len(cmaker.gsims)):
-                name = 'conditioned/gsim_%d/%s' % (g, key)
-                dstore.create_dset(name, val[g])
+        mea, tau, phi = computer.get_mea_tau_phi()
         del proxy.geom  # to reduce data transfer
+
     dstore.swmr_on()
     smap = parallel.Starmap(func, h5=dstore.hdf5)
     if save_tmp:
         save_tmp(smap.monitor)
+
+    # NB: for conditioned scenarios we are looping on a single trt
     for trt_smr, proxies in gb.items():
         trt = full_lt.trts[trt_smr // TWO24]
         extra = sitecol.array.dtype.names
         rlzs_by_gsim = full_lt.get_rlzs_by_gsim(trt_smr)
         cmaker = ContextMaker(trt, rlzs_by_gsim, oq, extraparams=extra)
         cmaker.min_mag = getdefault(oq.minimum_magnitude, trt)
+        if station_data is not None:
+            if parallel.oq_distribute() == 'zmq':
+                logging.error('Conditioned scenarios are not meant to be run'
+                              ' on a cluster')
+            smap.share(mea=mea, tau=tau, phi=phi)
         for block in block_splitter(proxies, totw, rup_weight):
             args = block, cmaker, (station_data, station_sites), dstore
             smap.submit(args)
@@ -609,9 +615,7 @@ class EventBasedCalculator(base.HazardCalculator):
         G = gsim_lt.get_num_paths()
         if oq.calculation_mode.startswith('scenario'):
             ngmfs = oq.number_of_ground_motion_fields
-        rup = (oq.rupture_dict or 'rupture_model' in oq.inputs and
-               oq.inputs['rupture_model'].endswith('.xml'))
-        if rup:
+        if oq.rupture_dict or oq.rupture_xml:
             # check the number of branchsets
             bsets = len(gsim_lt._ltnode)
             if bsets > 1:
@@ -676,7 +680,7 @@ class EventBasedCalculator(base.HazardCalculator):
         self.offset = 0
         if oq.hazard_calculation_id:  # from ruptures
             dstore.parent = datastore.read(oq.hazard_calculation_id)
-            self.full_lt = dstore.parent['full_lt']
+            self.full_lt = dstore.parent['full_lt'].init()
             set_mags(oq, dstore)
         elif hasattr(self, 'csm'):  # from sources
             set_mags(oq, dstore)
@@ -707,7 +711,8 @@ class EventBasedCalculator(base.HazardCalculator):
                 dstore.create_dset('gmf_data/slice_by_event', slice_dt)
 
         # event_based in parallel
-        eb = (event_based if parallel.oq_distribute() == 'slurm'
+        eb = (event_based if ('station_data' in oq.inputs or
+                              parallel.oq_distribute() == 'slurm')
               else gen_event_based)
         smap = starmap_from_rups(eb, oq, self.full_lt, self.sitecol, dstore)
         acc = smap.reduce(self.agg_dicts)
