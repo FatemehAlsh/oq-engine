@@ -834,25 +834,6 @@ def plane_fit(points):
     return ctr, numpy.linalg.svd(M)[0][:, -1]
 
 
-def get_strike_from_plane_normal(nrml):
-    """
-    Computes the strike direction using the vector defining the normal to the
-    plane. The positive z-direction is pointing upwards.
-
-    :param nrml:
-        A vector with 3 elements
-    :returns:
-        A float defining the strike direction
-    """
-
-    # Make sure the vector normal to the plane points upwards
-    if nrml[2] < 0:
-        nrml *= -1
-
-    # Get the strike
-    return numpy.rad2deg(numpy.arctan2(nrml[0], nrml[1])) - 90
-
-
 def bbox2poly(bbox):
     """
     :param bbox: a geographic bounding box West-East-North-South
@@ -944,12 +925,19 @@ def geohash3(lons, lats):
 def geolocate(lonlats, geom_df, exclude=()):
     """
     :param lonlats: array of shape (N, 2) of (lon, lat)
-    :param geom_df: DataFrame of geometries keyed by a "code" field
+    :param geom_df: DataFrame of geometries with a "code" field
     :returns: codes associated to the points
+
+    NB: if the "code" field is not a primary key, i.e. there are
+    different geometries with the same code, performs an "or", i.e.
+    associates the code if at least one of the geometries matches
     """
     codes = numpy.array(['???'] * len(lonlats))
-    for code, geom in zip(geom_df.code, geom_df.geom):
+    for code, df in geom_df.groupby('code'):
         if code in exclude:
             continue
-        codes[contains_xy(geom, lonlats)] = code
+        ok = numpy.zeros(len(lonlats), bool)
+        for geom in df.geom:
+            ok |= contains_xy(geom, lonlats)
+        codes[ok] = code
     return codes

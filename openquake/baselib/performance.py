@@ -219,8 +219,10 @@ class Monitor(object):
 
     @property
     def calc_dir(self):
-        """Calculation directory $HOME/oqdata/calc_XXX"""
-        return self.filename.rsplit('.', 1)[0]
+        """Calculation directory custom_tmp/oqdata/calc_XXX"""
+        path = os.path.join(self.config.directory.custom_tmp,
+                            os.path.basename(self.filename))
+        return path[:-5]  # strip .hdf5
 
     @property
     def mem(self):

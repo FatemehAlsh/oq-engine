@@ -31,7 +31,7 @@ def get_diff_idxs(array, rtol, atol):
     compute the relative differences and discard the one below the tolerance.
     :returns: indices where there are sensible differences.
     """
-    C, N, L = array.shape
+    C, N, _L = array.shape
     diff_idxs = set()  # indices of the sites with differences
     for n in range(N):
         for c in range(1, C):
@@ -130,7 +130,7 @@ class Comparator(object):
 
     def compare(self, what, imt, files, samplesites, rtol, atol):
         sids = self.getsids(samplesites)
-        if what == 'uhs':
+        if what == 'uhs':  # imt is -1, the last poe
             arrays = self.getuhs(what, imt, sids, rtol, atol)
         elif what.startswith('avg_gmf'):
             arrays = self.getgmf(what, imt, sids)
@@ -178,7 +178,8 @@ def compare_rates(calc_1: int, calc_2: int):
     with datastore.read(calc_1) as ds1, datastore.read(calc_2) as ds2:
         df1 = ds1.read_df('_rates', ['gid', 'sid', 'lid'])
         df2 = ds2.read_df('_rates', ['gid', 'sid', 'lid'])
-    print(df1.compare(df2))
+    delta = numpy.abs(df1 - df2).to_numpy().max()
+    print('Maximum difference in the rates =%s' % delta)
 
 
 # works only locally for the moment
@@ -401,7 +402,8 @@ def compare_assetcol(calc_ids: int):
     check_column_names(array0, array1, 'assetcol', *calc_ids)
     fields = set(array0.dtype.names) & set(array1.dtype.names) - {
         'site_id', 'id', 'ordinal', 'taxonomy'}
-    arr0, arr1 = check_intersect(array0, array1, 'id', sorted(fields), calc_ids)
+    arr0, arr1 = check_intersect(
+        array0, array1, 'id', sorted(fields), calc_ids)
     taxo0 = ds0['assetcol/tagcol/taxonomy'][:][arr0['taxonomy']]
     taxo1 = ds1['assetcol/tagcol/taxonomy'][:][arr1['taxonomy']]
     compare_column_values(taxo0, taxo1, 'taxonomy')
@@ -446,6 +448,20 @@ def compare_sitecol(calc_ids: int):
         check_intersect(array0, array1, 'sids', sorted(fields), calc_ids)
 
 
+def compare_oqparam(calc_ids: int):
+    """
+    Compare the dictionaries of parameters associated to the calculations
+    """
+    ds0 = datastore.read(calc_ids[0])
+    ds1 = datastore.read(calc_ids[1])
+    dic0 = vars(ds0['oqparam'])
+    dic1 = vars(ds1['oqparam'])
+    common = sorted(set(dic0) & set(dic1))
+    for key in common:
+        if dic0[key] != dic1[key]:
+            print('%s: %s != %s' % (key, dic0[key], dic1[key]))
+
+
 main = dict(rups=compare_rups,
             cumtime=compare_cumtime,
             uhs=compare_uhs,
@@ -458,11 +474,12 @@ main = dict(rups=compare_rups,
             sources=compare_sources,
             events=compare_events,
             assetcol=compare_assetcol,
-            sitecol=compare_sitecol)
+            sitecol=compare_sitecol,
+            oqparam=compare_oqparam)
 
 for f in (compare_uhs, compare_hmaps, compare_hcurves, compare_avg_gmf,
           compare_med_gmv, compare_risk_by_event, compare_sources,
-          compare_events, compare_assetcol, compare_sitecol):
+          compare_events, compare_assetcol, compare_sitecol, compare_oqparam):
     if f is compare_uhs:
         f.poe_id = 'index of the PoE (or return period)'
     elif f is compare_risk_by_event:
