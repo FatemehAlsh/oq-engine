@@ -177,8 +177,6 @@ class DisaggregationCalculator(base.HazardCalculator):
         self.M = len(self.imts)
         dstore = (self.datastore.parent if self.datastore.parent
                   else self.datastore)
-        # disaggregation is meant for few sites, i.e. no tiling
-        assert self.N < getters.CHUNKS, (self.N, getters.CHUNKS)
         self.mgetters = getters.map_getters(dstore, full_lt, disagg=True)
 
         # build array rlzs (N, Z)
@@ -186,9 +184,8 @@ class DisaggregationCalculator(base.HazardCalculator):
             Z = oq.num_rlzs_disagg
             rlzs = numpy.zeros((self.N, Z), int)
             if self.R > 1:
-                for mgetter in self.mgetters:
-                    sid = int(mgetter.name[6:])  # strip _rates
-                    hcurve = mgetter.get_hcurve(sid)
+                for sid in range(self.N):
+                    hcurve = self.mgetters[sid].get_hcurve(sid)
                     mean = getters.build_stat_curve(
                         hcurve, oq.imtls, stats.mean_curve, full_lt.weights,
                         full_lt.wget)

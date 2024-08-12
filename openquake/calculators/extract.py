@@ -233,9 +233,10 @@ def extract_realizations(dstore, dummy):
     scenario = 'scenario' in oq.calculation_mode
     full_lt = dstore['full_lt']
     rlzs = full_lt.rlzs
+    bpaths = encode(rlzs['branch_path'])
     # NB: branch_path cannot be of type hdf5.vstr otherwise the conversion
     # to .npz (needed by the plugin) would fail
-    bplen = len(rlzs[0]['branch_path'])
+    bplen = max(len(bp) for bp in bpaths)
     dt = [('rlz_id', U32), ('branch_path', '<S%d' % bplen), ('weight', F32)]
     arr = numpy.zeros(len(rlzs), dt)
     arr['rlz_id'] = rlzs['ordinal']
@@ -248,7 +249,7 @@ def extract_realizations(dstore, dummy):
         arr['branch_path'] = ['"%s"' % repr(gsim)[2:-1].replace('"', '""')
                               for gsim in gsims]  # quotes Excel-friendly
     else:  # use the compact representation for the branch paths
-        arr['branch_path'] = encode(rlzs['branch_path'])
+        arr['branch_path'] = bpaths
     return arr
 
 
@@ -591,7 +592,6 @@ def extract_sources(dstore, what):
         codes = [code.encode('utf8') for code in codes]
     fields = 'source_id code num_sites num_ruptures'
     info = dstore['source_info'][()][fields.split()]
-    wkt = decode(dstore['source_wkt'][()])
     arrays = []
     if source_ids is not None:
         logging.info('Extracting sources with ids: %s', source_ids)
@@ -613,14 +613,13 @@ def extract_sources(dstore, what):
     if not arrays:
         raise ValueError('There  no sources')
     info = numpy.concatenate(arrays)
-    wkt_gz = gzip.compress(';'.join(wkt).encode('utf8'))
     src_gz = gzip.compress(';'.join(decode(info['source_id'])).encode('utf8'))
     oknames = [name for name in info.dtype.names  # avoid pickle issues
                if name != 'source_id']
     arr = numpy.zeros(len(info), [(n, info.dtype[n]) for n in oknames])
     for n in oknames:
         arr[n] = info[n]
-    return ArrayWrapper(arr, {'wkt_gz': wkt_gz, 'src_gz': src_gz})
+    return ArrayWrapper(arr, {'src_gz': src_gz})
 
 
 @extract.add('gridded_sources')

@@ -16,14 +16,15 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with OpenQuake.  If not, see <http://www.gnu.org/licenses/>.
 
+import copy
+import zlib
 import os.path
 import pickle
 import operator
 import logging
-import zlib
 import numpy
 
-from openquake.baselib import parallel, general, hdf5, python3compat
+from openquake.baselib import parallel, general, hdf5, python3compat, config
 from openquake.hazardlib import nrml, sourceconverter, InvalidFile, calc, site
 from openquake.hazardlib.source.multi_fault import save_and_split
 from openquake.hazardlib.valid import basename, fragmentno
@@ -114,10 +115,9 @@ def build_rup_mutex(src_groups):
 
 def create_source_info(csm, h5):
     """
-    Creates source_info, source_wkt, trt_smrs, toms
+    Creates source_info, trt_smrs, toms
     """
     data = {}  # src_id -> row
-    wkts = []
     lens = []
     for srcid, srcs in general.groupby(
             csm.get_sources(), basename).items():
@@ -132,7 +132,6 @@ def create_source_info(csm, h5):
         lens.append(len(src.trt_smrs))
         row = [srcid, src.grp_id, code, 0, 0, num_ruptures,
                src.weight, mutex, trti]
-        wkts.append(getattr(src, '_wkt', ''))
         data[srcid] = row
 
     logging.info('There are %d groups and %d sources with len(trt_smrs)=%.2f',
@@ -143,7 +142,6 @@ def create_source_info(csm, h5):
     h5.create_dataset('source_info',  (num_srcs,), source_info_dt)
     h5['mutex_by_grp'] = mutex_by_grp(csm.src_groups)
     h5['rup_mutex'] = build_rup_mutex(csm.src_groups)
-    h5['source_wkt'] = numpy.array(wkts, hdf5.vstr)
 
 
 def trt_smrs(src):
@@ -272,14 +270,7 @@ def get_csm(oq, full_lt, dstore=None):
         logging.info('Applied {:_d} changes to the composite source model'.
                      format(changes))
     is_event_based = oq.calculation_mode.startswith(('event_based', 'ebrisk'))
-    if oq.sites and len(oq.sites) == 1:
-        # disable wkt in single-site calculations to avoid excessive slowdown
-        set_wkt = False
-    else:
-        set_wkt = True
-        logging.info('Setting src._wkt')
-
-    csm = _get_csm(full_lt, groups, is_event_based, set_wkt)
+    csm = _get_csm(full_lt, groups, is_event_based)
     out = []
     probs = []
     for sg in csm.src_groups:
@@ -481,7 +472,16 @@ def reduce_sources(sources_with_same_id, full_lt):
     return out
 
 
-def _get_csm(full_lt, groups, event_based, set_wkt):
+def split_by_tom(sources):
+    """
+    Groups together sources with the same TOM
+    """
+    def key(src):
+        return getattr(src, 'temporal_occurrence_model', None).__class__.__name__
+    return general.groupby(sources, key).values()
+
+
+def _get_csm(full_lt, groups, event_based):
     # 1. extract a single source from multiple sources with the same ID
     # 2. regroup the sources in non-atomic groups by TRT
     # 3. reorder the sources by source_id
@@ -502,23 +502,8 @@ def _get_csm(full_lt, groups, event_based, set_wkt):
                 srcs = reduce_sources(srcs, full_lt)
             lst.extend(srcs)
         for sources in general.groupby(lst, trt_smrs).values():
-            if set_wkt:
-                # set ._wkt attribute (for later storage in the source_wkt
-                # dataset); this is slow
-                msg = ('src "{}" has {:_d} underlying meshes with a total '
-                       'of {:_d} points!')
-                for src in [s for s in sources if s.code == b'N']:
-                    # check on NonParametricSources
-                    mesh_size = getattr(src, 'mesh_size', 0)
-                    if mesh_size > 1E6:
-                        logging.warning(msg.format(
-                            src.source_id, src.count_ruptures(), mesh_size))
-                    src._wkt = src.wkt()
-            src_groups.append(sourceconverter.SourceGroup(trt, sources))
-    if set_wkt:
-        for ag in atomic:
-            for src in ag:
-                src._wkt = src.wkt()
+            for grp in split_by_tom(sources):
+                src_groups.append(sourceconverter.SourceGroup(trt, grp))
     src_groups.extend(atomic)
     _fix_dupl_ids(src_groups)
 
@@ -696,7 +681,35 @@ class CompositeSourceModel:
         if not heavy:
             maxsrc = max(srcs, key=lambda s: s.weight)
             logging.info('Heaviest: %s', maxsrc)
-        return max_weight
+        return max_weight * 1.02  # increased a bit to produce a bit less tasks
+
+    def split(self, cmakers, sitecol, max_weight):
+        N = len(sitecol)
+        oq = cmakers[0].oq
+        max_gb = float(config.memory.pmap_max_gb)
+        for cmaker in cmakers:
+            size_gb = len(cmaker.gsims) * oq.imtls.size * N * 4 / 1024**3
+            grp = self.src_groups[cmaker.grp_id]
+            nsplits = general.ceil(grp.weight / max_weight)
+            if size_gb / nsplits > max_gb:
+                nsplits = general.ceil(size_gb / max_gb)
+            if oq.split_by_gsim:
+                # disabled since slower
+                for cm in self._split(cmaker, nsplits):
+                    yield cm, sitecol
+            else:
+                # normal case
+                for sites in sitecol.split(nsplits, minsize=oq.max_sites_disagg):
+                    yield cmaker, sites
+
+    def _split(self, cmaker, nsplits):
+        gsims = list(cmaker.gsims)
+        G = len(gsims)
+        for slc in general.gen_slices(0, G, general.ceil(G / nsplits)):
+            cm = copy.copy(cmaker)
+            cm.gid = cmaker.gid[slc]
+            cm.gsims = gsims[slc]
+            yield cm
 
     def __toh5__(self):
         G = len(self.src_groups)

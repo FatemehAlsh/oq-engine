@@ -182,7 +182,6 @@ import os
 import re
 import ast
 import sys
-import stat
 import time
 import socket
 import signal
@@ -190,8 +189,8 @@ import pickle
 import inspect
 import logging
 import operator
+import tempfile
 import traceback
-import subprocess
 import collections
 from unittest import mock
 import multiprocessing.dummy
@@ -216,47 +215,18 @@ MB = 1024 ** 2
 GB = 1024 ** 3
 host_cores = config.zworkers.host_cores.split(',')
 
-SLURM_BATCH = '''\
-#!/bin/bash
-#SBATCH --job-name={mon.operation}
-#SBATCH --time=10:00:00
-#SBATCH --mem-per-cpu=800M
-srun {python} -m openquake.baselib.slurm {mon.calc_dir} {start} {stop}
-'''
-SLURM_CHUNK = int(config.distribution.slurm_chunk)
 
-def sbatch(mon):
+def scratch_dir(job_id):
     """
-    Start a SLURM script via sbatch
+    :returns: scratch directory associated to the given job_id
     """
-    if mon.task_no == 1:
-        # there is only one task, run it in-core
-        slurm_task(mon.calc_dir, '1')
-        return 'Single task in-core'
-    sbatch = subprocess.run(['which', 'sbatch'], capture_output=True).stdout
-    starts = numpy.arange(1, mon.task_no + 1, SLURM_CHUNK)
-    for no, start in enumerate(starts, 1):
-        stop = min(mon.task_no, start + SLURM_CHUNK - 1)
-        sh = SLURM_BATCH.format(python=config.distribution.python, mon=mon,
-                                start=start, stop=stop)
-        path = os.path.join(mon.calc_dir, 'slurm.sh')
-        with open(path, 'w') as f:
-            f.write(sh)
-        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
-        cpus = '--cpus-per-task=%d' % min(Starmap.num_cores, stop - start + 1)
-        cmd = config.distribution.submit_cmd.split()[:-2] + [cpus, path]
-        logging.info(f'{no=} {cpus} {mon.calc_dir} {start} {stop}')
-        if no == len(starts) or not sbatch:
-            # spawn a few tasks on the current node
-            for task_id in range(start, stop + 1, 2):
-                mp_context.Process(
-                    target=slurm_task, args=(mon.calc_dir, str(task_id), '2')
-                ).start()
-        else:
-            proc = subprocess.run(cmd, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)
-            # logging a string like "Submitted batch job 5573363"
-            logging.info(proc.stdout.decode('utf8').strip())
-
+    tmp = config.directory.custom_tmp or tempfile.gettempdir()
+    dirname = os.path.join(tmp, f'calc_{job_id}')
+    try:
+        os.mkdir(dirname)
+    except FileExistsError:  # already created
+        pass
+    return dirname
 
 @submit.add('no')
 def no_submit(self, func, args, monitor):
@@ -273,12 +243,13 @@ def threadpool_submit(self, func, args, monitor):
     self.pool.apply_async(safely_call, (func, args, self.task_no, monitor))
 
 
-@submit.add('zmq')
+@submit.add('zmq', 'slurm')
 def zmq_submit(self, func, args, monitor):
     idx = self.task_no % len(host_cores)
     host = host_cores[idx].split()[0]
     port = int(config.zworkers.ctrl_port)
     dest = 'tcp://%s:%d' % (host, port)
+    logging.debug('Sending to %s', dest)
     with Socket(dest, zmq.REQ, 'connect', timeout=300) as sock:
         sub = sock.send((func, args, self.task_no, monitor))
         assert sub == 'submitted', sub
@@ -287,17 +258,6 @@ def zmq_submit(self, func, args, monitor):
 @submit.add('ipp')
 def ipp_submit(self, func, args, monitor):
     self.executor.submit(safely_call, func, args, self.task_no, monitor)
-
-
-@submit.add('slurm')
-def slurm_submit(self, func, args, monitor):
-    calc_dir = monitor.calc_dir  # custom_tmp/calc_XXX
-    if not os.path.exists(calc_dir):
-        os.mkdir(calc_dir)
-    inpname = str(self.task_no + 1) + '.inp'
-    with open(os.path.join(calc_dir, inpname), 'wb') as f:
-        pickle.dump((func, args, monitor), f, pickle.HIGHEST_PROTOCOL)
-    logging.debug('saved %s', os.path.join(calc_dir, inpname))
 
 
 def oq_distribute(task=None):
@@ -470,10 +430,10 @@ class Result(object):
                     'The master is at version %s while the worker %s is at '
                     'version %s' % (mon.version, socket.gethostname(),
                                     engine_version()))
-            if mon.config.dbserver.host != config.dbserver.host:
+            if mon.dbserver_host != config.dbserver.host:
                 raise RuntimeError(
                     'The master has dbserver.host=%s while the worker has %s'
-                    % (mon.config.dbserver.host, config.dbserver.host))
+                    % (mon.dbserver_host, config.dbserver.host))
             with mon:
                 val = func(*args)
         except StopIteration:
@@ -504,8 +464,7 @@ def check_mem_usage(soft_percent=None, hard_percent=None):
         return msg % (used_mem_percent, socket.gethostname())
 
 
-dummy_mon = Monitor()
-dummy_mon.config = config
+dummy_mon = Monitor(dbserver_host=config.dbserver.host)
 dummy_mon.backurl = None
 DEBUG = False
 
@@ -724,13 +683,17 @@ class SharedArray(object):
         self.sm.close()
         self.sm.unlink()
 
-
-# use only the "visible" cores, not the total system cores
-# if the underlying OS supports it (macOS does not)
-try:
+# determine the number of cores to use
+cpu_count = psutil.cpu_count()
+if sys.platform == 'win32':
+    # assume hyperthreading is on; use half the threads to save memory
+    tot_cores = cpu_count // 2 or 1
+elif sys.platform == 'linux':
+    # use only the "visible" cores, not the total system cores
+    # if the underlying OS supports it (macOS does not)
     tot_cores = len(psutil.Process().cpu_affinity())
-except AttributeError:
-    tot_cores = psutil.cpu_count()
+else:
+    tot_cores = cpu_count
 
 
 class Starmap(object):
@@ -738,7 +701,7 @@ class Starmap(object):
     running_tasks = []  # currently running tasks
     maxtasksperchild = None  # with 1 it hangs on the EUR calculation!
     num_cores = int(config.distribution.get('num_cores', '0')) or tot_cores
-    CT = num_cores * 2
+    CT = num_cores * 3 if num_cores < cpu_count else num_cores * 2
 
     @classmethod
     def init(cls, distribute=None):
@@ -838,7 +801,7 @@ class Starmap(object):
             self.name = task_args[0][1].__name__
         else:
             self.name = task_func.__name__
-        self.monitor = Monitor(self.name)
+        self.monitor = Monitor(self.name, dbserver_host=config.dbserver.host)
         self.monitor.filename = h5.filename
         self.monitor.calc_id = self.calc_id
         self.task_args = task_args
@@ -880,6 +843,15 @@ class Starmap(object):
             self.prev_percent = percent
         return done
 
+    def init_slurm(self):
+        """
+        Initialize the list host_cores by reading the file with the hostcores
+        generated by the worker nodes
+        """
+        scr = scratch_dir(self.monitor.calc_id)
+        with open(os.path.join(scr, 'hostcores')) as f:
+            host_cores[:] = [ln.strip() for ln in f.readlines()]
+
     def submit(self, args, func=None):
         """
         Submit the given arguments to the underlying task
@@ -891,7 +863,8 @@ class Starmap(object):
             self.monitor.shared = self._shared
             self.monitor.backurl = 'tcp://%s:%s' % (
                 self.return_ip, self.socket.port)
-            self.monitor.config = config
+            if self.distribute == 'slurm':
+                self.init_slurm()
         OQ_TASK_NO = os.environ.get('OQ_TASK_NO')
         if OQ_TASK_NO is not None and self.task_no != int(OQ_TASK_NO):
             self.task_no += 1
@@ -934,9 +907,7 @@ class Starmap(object):
                                for args in self.task_args]
         dist = 'no' if self.num_tasks == 1 else self.distribute
         if dist == 'slurm':
-            if not config.directory.custom_tmp:
-                raise ValueError('[directory]custom_tmp is missing '
-                                 'in openquake.cfg')
+            # submit the tasks via zmq
             for func, args in self.task_queue:
                 self.submit(args, func=func)
             self.task_queue.clear()
@@ -988,7 +959,7 @@ class Starmap(object):
         dist = 'no' if self.num_tasks == 1 else self.distribute
         if dist == 'slurm':
             self.monitor.task_no = self.task_no  # total number of tasks
-            sbatch(self.monitor)
+            #sbatch(self.monitor)
 
         elif self.task_queue:
             first_args = self.task_queue[:self.CT]
@@ -1146,7 +1117,8 @@ def multispawn(func, allargs, nprocs=Starmap.num_cores, logfinish=True):
 
 def slurm_task(calc_dir: str, task_id: str, delta='1'):
     """
-    Task in a SLURM job array
+    Read the files '<task_id>.inp' ... '<task_id+delta>.inp' and
+    run safely and sequentially the corresponding tasks.
     """
     t = int(task_id)
     for task in range(t, t + int(delta)):
@@ -1158,9 +1130,20 @@ def slurm_task(calc_dir: str, task_id: str, delta='1'):
 
 
 def slurm_tasks(calc_dir, start, stop):
+    """
+    Read the files '<start>.inp' ... '<stop>.inp' and
+    run safely and concurrently the corresponding tasks.
+    """
     start = int(start)
     stop = int(stop)
     allargs = [(calc_dir, str(task_id))
                for task_id in range(start, stop + 1)]
     nprocs = min(stop + 1 - start, Starmap.num_cores)
     multispawn(slurm_task, allargs, nprocs, logfinish=False)
+
+
+if oq_distribute() == 'slurm':
+    if not config.directory.custom_tmp:
+        raise ValueError('oq_distribute=slurm requires setting custom_tmp')
+    if not hasattr(config.distribution, 'num_cores'):
+        raise ValueError('oq_distribute=slurm requires setting num_cores')

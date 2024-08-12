@@ -22,7 +22,7 @@ import logging
 import operator
 import numpy
 import h5py
-from openquake.baselib import general, parallel, hdf5
+from openquake.baselib import general, parallel, hdf5, config
 from openquake.hazardlib import pmf, geo, source_reader
 from openquake.baselib.general import AccumDict, groupby, block_splitter
 from openquake.hazardlib.contexts import read_cmakers
@@ -34,7 +34,7 @@ from openquake.hazardlib.calc.filters import (
     getdefault, split_source, SourceFilter)
 from openquake.hazardlib.scalerel.point import PointMSR
 from openquake.commonlib import readinput
-from openquake.calculators import base
+from openquake.calculators import base, getters
 
 U16 = numpy.uint16
 U32 = numpy.uint32
@@ -123,8 +123,6 @@ def preclassical(srcs, sites, cmaker, secparams, monitor):
             else:
                 mask = None
             src.set_msparams(secparams, mask, ry0, mon1, mon2)
-            if (src.msparams['area'] == 0).all():
-                continue # all ruptures are far away
         if sites:
             # NB: this is approximate, since the sites are sampled
             src.nsites = len(sf.close_sids(src))  # can be 0
@@ -163,6 +161,35 @@ def preclassical(srcs, sites, cmaker, secparams, monitor):
                 dic['before'] = len(block)
                 dic['after'] = len(dic[grp_id])
                 yield dic
+
+
+def store_tiles(dstore, csm, sitecol, cmakers):
+    """
+    Store a `tiles` array if the calculation is large enough.
+    :returns: a triple (max_weight, trt_rlzs, gids)
+    """
+    N = len(sitecol)
+    oq = cmakers[0].oq
+    max_weight = csm.get_max_weight(oq)
+    max_gb = float(config.memory.pmap_max_gb)
+    req_gb, trt_rlzs, gids = getters.get_pmaps_gb(dstore, csm.full_lt)
+    fac = oq.imtls.size * N * 4 / 1024**3
+    sizes = [len(cm.gsims) * fac for cm in cmakers]
+    ok = req_gb < max_gb and max(sizes) < max_gb
+    regular = ok or oq.disagg_by_src or N < oq.max_sites_disagg or oq.tile_spec
+    tiles = numpy.array([(cm.grp_id, len(cm.gsims), len(tile),
+                          len(cm.gsims) * fac * len(tile) / N)
+                         for cm, tile in csm.split(cmakers, sitecol, max_weight)],
+                        [('grp_id', U16), ('G', U16), ('N', U32), ('gb', F32)])
+    dstore.create_dset('tiles', tiles, fillvalue=None,
+                       attrs=dict(req_gb=req_gb, tiling=not regular))
+    if not regular:
+        logging.info('This will be a tiling calculation with %d tasks, min_sites=%d',
+                     len(tiles), min(tiles['N']))
+        if req_gb >= 30 and (not config.directory.custom_tmp or
+                             not config.distribution.save_on_tmp):
+            logging.info('We suggest to set custom_tmp and save_on_tmp')
+    return req_gb, max_weight, trt_rlzs, gids
 
 
 @base.calculators.add('preclassical')
@@ -345,7 +372,6 @@ class PreClassicalCalculator(base.HazardCalculator):
             else:
                 if cachepath:
                     os.symlink(self.datastore.filename, cachepath)
-        self.max_weight = self.csm.get_max_weight(self.oqparam)
         return self.csm
 
     def post_execute(self, csm):
@@ -359,7 +385,7 @@ class PreClassicalCalculator(base.HazardCalculator):
                        for row in self.csm.source_info.values())
         if totsites == 0:
             if self.N == 1:
-                logging.warning('There are no sources close to the site!')
+                logging.error('There are no sources close to the site!')
             else:
                 raise RuntimeError(
                     'There are no sources close to the site(s)! '
@@ -371,6 +397,10 @@ class PreClassicalCalculator(base.HazardCalculator):
                       for idx, row in enumerate(self.csm.source_info.values())}
             deltas = readinput.read_delta_rates(fname, idx_nr)
             self.datastore.hdf5.save_vlen('delta_rates', deltas)
+
+        # save 'ntiles' if the calculation is large
+        self.req_gb, self.max_weight, self.trt_rlzs, self.gids = (
+            store_tiles(self.datastore, self.csm, self.sitecol, self.cmakers))
 
     def post_process(self):
         if self.oqparam.calculation_mode == 'preclassical':

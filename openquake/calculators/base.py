@@ -63,6 +63,8 @@ U32 = numpy.uint32
 F32 = numpy.float32
 TWO16 = 2 ** 16
 TWO32 = 2 ** 32
+EBDOC = ('https://docs.openquake.org/oq-engine/master/manual/user-guide/'
+         'advanced/advanced-calculations.html#understanding-the-hazard')
 
 stats_dt = numpy.dtype([('mean', F32), ('std', F32),
                         ('min', F32), ('max', F32),
@@ -99,7 +101,8 @@ def check_imtls(this, parent):
     Fix the hazard_imtls of two calculations if possible
     """
     for imt, imls in this.items():
-        if len(imls) != len(parent[imt]) or (imls != parent[imt]).any():
+        if len(imls) != len(parent[imt]) or (
+                F32(imls) != F32(parent[imt])).any():
             raise ValueError('The intensity measure levels %s are different '
                              'from the parent levels %s for %s' % (
                                  imls, parent[imt], imt))
@@ -625,6 +628,8 @@ class HazardCalculator(BaseCalculator):
                 oq, oq.inputs['hazard_curves'])
             df = (~pmap).to_dframe()
             self.datastore.create_df('_rates', df)
+            slices = numpy.array([(0, 0, len(df))], getters.slice_dt)
+            self.datastore['_rates/slice_by_idx'] = slices
             self.datastore['assetcol'] = self.assetcol
             self.datastore['full_lt'] = logictree.FullLogicTree.fake()
             self.datastore['trt_rlzs'] = U32([[0]])
@@ -639,8 +644,8 @@ class HazardCalculator(BaseCalculator):
             calc.run(remove=False)
             calc.datastore.close()
             for name in (
-                'csm param sitecol assetcol crmodel realizations max_weight '
-                'amplifier policy_df treaty_df full_lt exported'
+                'csm param sitecol assetcol crmodel realizations max_gb max_weight '
+                'amplifier policy_df treaty_df full_lt exported trt_rlzs gids'
             ).split():
                 if hasattr(calc, name):
                     setattr(self, name, getattr(calc, name))
@@ -909,6 +914,10 @@ class HazardCalculator(BaseCalculator):
             if self.sitecol and oq.imtls:
                 logging.info('Read N=%d hazard sites and L=%d hazard levels',
                              len(self.sitecol), oq.imtls.size)
+        if (oq.calculation_mode.startswith(('event_based', 'ebrisk')) and
+                self.N > 1000 and len(oq.min_iml) == 0):
+            oq.raise_invalid(f'minimum_intensity must be set, see {EBDOC}')
+
         if oq_hazard:
             parent = self.datastore.parent
             if 'assetcol' in parent:
@@ -925,6 +934,9 @@ class HazardCalculator(BaseCalculator):
     def _read_risk2(self):
         oq = self.oqparam
         if oq.job_type == 'risk':
+            if not hasattr(self, 'assetcol'):
+                oq.raise_invalid('missing exposure')
+
             # the decode below is used in aristotle calculations
             taxonomies = python3compat.decode(
                 self.assetcol.tagcol.taxonomy[1:])

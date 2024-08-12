@@ -185,6 +185,7 @@ LOGGING = {
 }
 
 FILE_UPLOAD_MAX_MEMORY_SIZE = 1
+FILE_UPLOAD_TEMP_DIR = config.directory.custom_tmp or tempfile.gettempdir()
 
 # A server name can be specified to customize the WebUI in case of
 # multiple installations of the Engine are available. This helps avoiding
@@ -195,6 +196,11 @@ APPLICATION_MODES = [
     'PUBLIC', 'RESTRICTED', 'AELO', 'ARISTOTLE', 'READ_ONLY', 'TOOLS_ONLY']
 
 APPLICATION_MODE = 'PUBLIC'
+
+try:
+    EXTERNAL_TOOLS = True if os.environ['EXTERNAL_TOOLS'] == 'True' else False
+except KeyError:
+    EXTERNAL_TOOLS = False
 
 # If False, a warning is displayed in case a newer version of the engine has
 # been released

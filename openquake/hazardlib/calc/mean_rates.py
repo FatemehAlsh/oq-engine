@@ -23,6 +23,7 @@ from openquake.hazardlib.calc.hazard_curve import classical
 from openquake.hazardlib.map_array import MapArray
 from openquake.hazardlib.contexts import get_cmakers
 
+F32 = numpy.float32
 CUTOFF = 1E-12
 
 
@@ -71,11 +72,11 @@ def calc_rmap(src_groups, full_lt, sitecol, oq):
         dic = classical(group, sitecol, cmaker)
         if len(dic['rup_data']) == 0:  # the group was filtered away
             continue
-        rates = to_rates(dic['pmap'].array)
+        rates = dic['pnemap'].to_rates()
         ctxs.append(numpy.concatenate(dic['rup_data']).view(numpy.recarray))
         for i, gid in enumerate(gids[cmaker.grp_id]):
             # += tested in logictree/case_05
-            rmap.array[:, :, gid] += rates[:, :, i % G]
+            rmap.array[:, :, gid] += rates.array[:, :, i % G]
     return rmap, ctxs, cmakers
 
 
